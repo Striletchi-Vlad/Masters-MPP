@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <cstdlib>
+#include <omp.h>
 
 // Helper: check if a file exists
 bool fileExists(const std::string &filename) {
@@ -156,6 +157,21 @@ void multithreadedMultiply(const std::vector<double> &A, const std::vector<doubl
     }
 }
 
+void openmpMultiply(const std::vector<double>& A, const std::vector<double>& B,
+                    std::vector<double>& C, int M, int numThreads) {
+    // Parallelize the outer loop using OpenMP, with a specified number of threads.
+    #pragma omp parallel for num_threads(numThreads) schedule(static)
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < M; j++) {
+            double sum = 0.0;
+            for (int k = 0; k < M; k++) {
+                sum += A[i * M + k] * B[k * M + j];
+            }
+            C[i * M + j] = sum;
+        }
+    }
+}
+
 // Structure to hold timing results
 struct Timing {
     double t_reading;
@@ -164,7 +180,7 @@ struct Timing {
     double t_total;
 };
 
-enum VariantType { V1, V2A, V2B };
+enum VariantType { V1, V2A, V2B, V3A, V3B };
 
 
 // Run one experiment iteration using the given multiplication function.
@@ -185,6 +201,12 @@ Timing runExperiment(const std::string &fileA, const std::string &fileB, const s
     } else if (var == V2B) {
 	    parallelReadMatrix(fileA, A, M, numThreads);
 	    parallelReadMatrix(fileB, B, M, numThreads);
+    } else if (var == V3A) {
+	    sequentialReadMatrix(fileA, A, M);
+	    sequentialReadMatrix(fileB, B, M);
+    } else if (var == V3B) {
+	    parallelReadMatrix(fileA, A, M, numThreads);
+	    parallelReadMatrix(fileB, B, M, numThreads);
     }
 	auto endRead = std::chrono::high_resolution_clock::now();
     t.t_reading = std::chrono::duration<double>(endRead - startRead).count();
@@ -197,6 +219,10 @@ Timing runExperiment(const std::string &fileA, const std::string &fileB, const s
         multithreadedMultiply(A, B, C, M, numThreads);
     } else if (var == V2B) {
         sequentialMultiply(A, B, C, M);
+    } else if (var == V3A) {
+			openmpMultiply(A, B, C, M, numThreads);
+    } else if (var == V3B) {
+			openmpMultiply(A, B, C, M, numThreads);
     }
     auto endMul = std::chrono::high_resolution_clock::now();
     t.t_multiplication = std::chrono::duration<double>(endMul - startMul).count();
@@ -258,7 +284,7 @@ int main(int argc, char* argv[]) {
 
     fileA = "A_M" + std::to_string(M) + ".bin";
 	fileB = "B_M" + std::to_string(M) + ".bin";
-	fileC = "C_M" + std::to_string(M) + ".txt";
+	fileC = "C_V" + variantStr + "_M" + std::to_string(M) + ".txt"; 
 	jsonFile = variantStr + "_M" + std::to_string(M) + "_T" + std::to_string(numThreads) + ".json";
 
     if (M <= 0 || variantStr.empty() || fileA.empty() || fileB.empty() || fileC.empty() || jsonFile.empty()) {
@@ -274,6 +300,10 @@ int main(int argc, char* argv[]) {
 			currentVariant = V2A;
     } else if (variantStr == "2b") {
 			currentVariant = V2B;
+    } else if (variantStr == "3a") {
+			currentVariant = V3A;
+    } else if (variantStr == "3b") {
+			currentVariant = V3B;
     } else {
 	std::cerr << "Unknown variant: " << variantStr << "\n";
 	return 1;
