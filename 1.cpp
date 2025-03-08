@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <omp.h>
+#include <mpi.h>
 
 // Helper: check if a file exists
 bool fileExists(const std::string &filename) {
@@ -172,6 +173,158 @@ void openmpMultiply(const std::vector<double>& A, const std::vector<double>& B,
     }
 }
 
+// MPI implementation of matrix multiplication using Cannon's algorithm.
+// A, B, and C are stored as row-major 1D arrays of size M*M.
+// It is assumed that M is divisible by Q = sqrt(usedProcs),
+// where usedProcs = Q*Q and Q = floor(sqrt(total MPI processes)).
+void mpiCannonMultiply(const std::vector<double>& A,
+                       const std::vector<double>& B,
+                       std::vector<double>& C, int M) {
+    int worldRank, worldSize;
+    MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
+    MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
+
+    // Determine grid dimensions from the total processes.
+    int gridDim = static_cast<int>(std::floor(std::sqrt(worldSize)));
+    int usedProcs = gridDim * gridDim; // Only these many processes participate.
+
+    // Create a new group and communicator for the used processes.
+    MPI_Group worldGroup;
+    MPI_Comm_group(MPI_COMM_WORLD, &worldGroup);
+    std::vector<int> gridRanks(usedProcs);
+    for (int i = 0; i < usedProcs; i++) {
+        gridRanks[i] = i;  // use the first usedProcs ranks
+    }
+    MPI_Group gridGroup;
+    MPI_Group_incl(worldGroup, usedProcs, gridRanks.data(), &gridGroup);
+    MPI_Comm gridComm;
+    MPI_Comm_create(MPI_COMM_WORLD, gridGroup, &gridComm);
+
+    // Processes not in the grid communicator simply exit.
+    if (gridComm == MPI_COMM_NULL) {
+        MPI_Group_free(&worldGroup);
+        MPI_Group_free(&gridGroup);
+        return;
+    }
+
+    // Create a 2D Cartesian communicator for the grid.
+    int dims[2]    = { gridDim, gridDim };
+    int periods[2] = { 1, 1 }; // wrap-around in both dimensions for Cannon's shifts
+    int reorder    = 1;
+    MPI_Comm cartComm;
+    MPI_Cart_create(gridComm, 2, dims, periods, reorder, &cartComm);
+
+    int cartRank;
+    MPI_Comm_rank(cartComm, &cartRank);
+    int coords[2];
+    MPI_Cart_coords(cartComm, cartRank, 2, coords);
+
+    // Compute the local block size.
+    // (Assumes M is divisible by gridDim.)
+    int blockSize = M / gridDim;
+
+    // Allocate local blocks for A, B, and the result C.
+    std::vector<double> localA(blockSize * blockSize);
+    std::vector<double> localB(blockSize * blockSize);
+    std::vector<double> localC(blockSize * blockSize, 0.0);
+
+    // Create a derived datatype that describes a block (submatrix) of size blockSize x blockSize
+    // in an M x M matrix stored in row-major order.
+    MPI_Datatype blockType, blockTypeResized;
+    MPI_Type_vector(blockSize, blockSize, M, MPI_DOUBLE, &blockType);
+    MPI_Type_create_resized(blockType, 0, blockSize * sizeof(double), &blockTypeResized);
+    MPI_Type_commit(&blockTypeResized);
+    MPI_Type_free(&blockType); // no longer needed
+
+    // Prepare parameters for scattering the full matrices.
+    // Only the root (cartComm rank 0) holds the full matrices.
+    std::vector<int> sendCounts, displs;
+    if (cartRank == 0) {
+        sendCounts.resize(usedProcs, 1);
+        displs.resize(usedProcs);
+        // For each block, compute the displacement in the global matrix.
+        // The starting element of the block at grid position (i, j) is at row i*blockSize and col j*blockSize.
+        for (int i = 0; i < gridDim; i++) {
+            for (int j = 0; j < gridDim; j++) {
+                displs[i * gridDim + j] = i * M + j * blockSize;
+            }
+        }
+    }
+
+    // Scatter the blocks of matrix A into localA.
+    MPI_Scatterv((cartRank == 0 ? A.data() : nullptr),
+                 (cartRank == 0 ? sendCounts.data() : nullptr),
+                 (cartRank == 0 ? displs.data() : nullptr),
+                 blockTypeResized,
+                 localA.data(), blockSize * blockSize, MPI_DOUBLE,
+                 0, cartComm);
+
+    // Scatter the blocks of matrix B into localB.
+    MPI_Scatterv((cartRank == 0 ? B.data() : nullptr),
+                 (cartRank == 0 ? sendCounts.data() : nullptr),
+                 (cartRank == 0 ? displs.data() : nullptr),
+                 blockTypeResized,
+                 localB.data(), blockSize * blockSize, MPI_DOUBLE,
+                 0, cartComm);
+
+    // Initial alignment for Cannon's algorithm:
+    // Shift localA left by its row coordinate and localB up by its column coordinate.
+    int src, dst;
+    // For A: shift left by coords[0]
+    MPI_Cart_shift(cartComm, 1, -coords[0], &src, &dst);
+    MPI_Sendrecv_replace(localA.data(), blockSize * blockSize, MPI_DOUBLE,
+                         dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
+    // For B: shift up by coords[1]
+    MPI_Cart_shift(cartComm, 0, -coords[1], &src, &dst);
+    MPI_Sendrecv_replace(localB.data(), blockSize * blockSize, MPI_DOUBLE,
+                         dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
+
+    // Main loop of Cannon's algorithm.
+    for (int step = 0; step < gridDim; step++) {
+        // Multiply local blocks and accumulate into localC.
+        for (int i = 0; i < blockSize; i++) {
+            for (int j = 0; j < blockSize; j++) {
+                for (int k = 0; k < blockSize; k++) {
+                    localC[i * blockSize + j] += localA[i * blockSize + k] * localB[k * blockSize + j];
+                }
+            }
+        }
+        // Shift localA left by one.
+        MPI_Cart_shift(cartComm, 1, -1, &src, &dst);
+        MPI_Sendrecv_replace(localA.data(), blockSize * blockSize, MPI_DOUBLE,
+                             dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
+        // Shift localB up by one.
+        MPI_Cart_shift(cartComm, 0, -1, &src, &dst);
+        MPI_Sendrecv_replace(localB.data(), blockSize * blockSize, MPI_DOUBLE,
+                             dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
+    }
+
+    // Gather the computed localC blocks to the root (cartComm rank 0).
+    std::vector<double> gatheredC;
+    if (cartRank == 0) {
+        gatheredC.resize(M * M, 0.0);
+    }
+    MPI_Gatherv(localC.data(), blockSize * blockSize, MPI_DOUBLE,
+                (cartRank == 0 ? gatheredC.data() : nullptr),
+                (cartRank == 0 ? sendCounts.data() : nullptr),
+                (cartRank == 0 ? displs.data() : nullptr),
+                blockTypeResized,
+                0, cartComm);
+
+    // Now, have the rank 0 process of MPI_COMM_WORLD (which is also cartComm rank 0)
+    // copy the gathered result into C.
+    if (worldRank == 0 && cartRank == 0) {
+        C = gatheredC;
+    }
+
+    // Clean up.
+    MPI_Type_free(&blockTypeResized);
+    MPI_Comm_free(&cartComm);
+    MPI_Comm_free(&gridComm);
+    MPI_Group_free(&gridGroup);
+    MPI_Group_free(&worldGroup);
+}
+
 // Structure to hold timing results
 struct Timing {
     double t_reading;
@@ -180,7 +333,7 @@ struct Timing {
     double t_total;
 };
 
-enum VariantType { V1, V2A, V2B, V3A, V3B };
+enum VariantType { V1, V2A, V2B, V3A, V3B, V4A };
 
 
 // Run one experiment iteration using the given multiplication function.
@@ -207,6 +360,9 @@ Timing runExperiment(const std::string &fileA, const std::string &fileB, const s
     } else if (var == V3B) {
 	    parallelReadMatrix(fileA, A, M, numThreads);
 	    parallelReadMatrix(fileB, B, M, numThreads);
+    } else if (var == V4A) {
+	    sequentialReadMatrix(fileA, A, M);
+	    sequentialReadMatrix(fileB, B, M);
     }
 	auto endRead = std::chrono::high_resolution_clock::now();
     t.t_reading = std::chrono::duration<double>(endRead - startRead).count();
@@ -223,13 +379,22 @@ Timing runExperiment(const std::string &fileA, const std::string &fileB, const s
 			openmpMultiply(A, B, C, M, numThreads);
     } else if (var == V3B) {
 			openmpMultiply(A, B, C, M, numThreads);
+    } else if (var == V4A) {
+			mpiCannonMultiply(A, B, C, M);
     }
     auto endMul = std::chrono::high_resolution_clock::now();
     t.t_multiplication = std::chrono::duration<double>(endMul - startMul).count();
 
     // Writing phase (output in plaintext)
+	// only write the result if process is rank 0
     auto startWrite = std::chrono::high_resolution_clock::now();
-    writeMatrix(fileC, C, M);
+	int worldRank;
+	MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
+	std::cout << "Writing output if needed, world rank: " << worldRank << "\n";
+	if (worldRank == 0) {
+			writeMatrix(fileC, C, M);
+			std::cout << "Output written to " << fileC << "\n";
+    }
     auto endWrite = std::chrono::high_resolution_clock::now();
     t.t_writing = std::chrono::duration<double>(endWrite - startWrite).count();
 
@@ -268,6 +433,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+	MPI_Init(&argc, &argv);
+
     std::string variantStr, fileA, fileB, fileC, jsonFile;
     int M = 0;
     int numThreads = 1;
@@ -304,6 +471,8 @@ int main(int argc, char* argv[]) {
 			currentVariant = V3A;
     } else if (variantStr == "3b") {
 			currentVariant = V3B;
+    } else if (variantStr == "4a") {
+			currentVariant = V4A;
     } else {
 	std::cerr << "Unknown variant: " << variantStr << "\n";
 	return 1;
@@ -331,7 +500,8 @@ int main(int argc, char* argv[]) {
     std::cout << "Running experiment with variant " << variantStr << " and matrix size " << M << "\n";
 
     // Run 10 executions for the chosen variant
-    const int numRuns = 10;
+    // const int numRuns = 10;
+    const int numRuns = 1;
     double totalReading = 0.0, totalMultiplication = 0.0, totalWriting = 0.0, totalTotal = 0.0;
     for (int run = 0; run < numRuns; run++) {
 	std::cout << "Run " << run + 1 << " of " << numRuns << "\n";
@@ -347,12 +517,18 @@ int main(int argc, char* argv[]) {
     double avgTotal = totalTotal / numRuns;
 
     // Output the averaged timings and speed-up in JSON format.
-    try {
-        writeJSON(jsonFile, variantStr, avgReading, avgMultiplication, avgWriting, avgTotal);
-        std::cout << "Experiment completed. Results written to " << jsonFile << "\n";
-    } catch (const std::exception &e) {
-        std::cerr << "Error writing JSON output: " << e.what() << "\n";
-        return 1;
+    auto startWrite = std::chrono::high_resolution_clock::now();
+	int worldRank;
+	MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
+	std::cout << "Writing JSON output if needed, world rank: " << worldRank << "\n";
+	if (worldRank == 0) {
+			try {
+				writeJSON(jsonFile, variantStr, avgReading, avgMultiplication, avgWriting, avgTotal);
+				std::cout << "Experiment completed. Results written to " << jsonFile << "\n";
+			} catch (const std::exception &e) {
+				std::cerr << "Error writing JSON output: " << e.what() << "\n";
+				return 1;
+			}
     }
 
     return 0;
