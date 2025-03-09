@@ -453,11 +453,10 @@ void writeJSON(const std::string &jsonFile, const std::string &variantName, doub
         throw std::runtime_error("Cannot open file " + jsonFile + " for writing JSON output.");
     }
     fout << "{\n";
-    fout << "  \"Var\": \"" << variantName << "\",\n";
     fout << "  \"T_reading\": " << avgReading << ",\n";
     fout << "  \"T_multiplication\": " << avgMul << ",\n";
     fout << "  \"T_writing\": " << avgWrite << ",\n";
-    fout << "  \"T_total\": " << avgTotal << ",\n";
+    fout << "  \"T_total\": " << avgTotal << "\n";
     fout << "}\n";
     fout.close();
 }

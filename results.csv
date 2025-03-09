@@ -1,0 +1,3 @@
+variant,T_reading,T_multiplication,T_writing,T_total,speedup
+1_M1000_T1_B1.json,0.014909,6.85477,0.376571,7.24625,1.0
+2a_M1000_T10_B1.json,0.0149541,1.09587,0.378488,1.48932,4.865475519028818
