@@ -14,7 +14,7 @@
     - **Cost**: C = T_p * p = O(M^2 + M^3 / p) * p = **O(pM^2 + M^3)**.
 - **2b: Parallel reading, sequential multiplication, sequential writing.**
     - **Time Complexity**: Parallel reading with p threads can potentially reduce the reading time to **O(M^2 / p)**. Sequential multiplication remains **O(M^3)**. Sequential writing takes **O(M^2)**. The overall time complexity is **O(M^2 / p + M^3 + M^2) ≈ O(M^3)**, as the sequential multiplication dominates.
-    - **Speed-up**: S = T_s / T_p = O(M^3) / O(M^3 + M^2 / p). The speed-up will be slightly less than 1 if the reading time was a significant portion of the sequential time. Generally, Speed-up will be **≤ 1**.
+    - **Speed-up**: S = T_s / T_p = O(M^3) / O(M^3 + M^2 / p). The speed-up will be slightly larger than 1 if the reading time was a significant portion of the sequential time. Generally, Speed-up will be **>= 1**.
     - **Efficiency**: E = S / p ≈ (O(M^3) / (M^3 + M^2 / p)) / p = O(M^3) / (pM^3 + M^2). Efficiency will be **O(1/p)**.
     - **Cost**: C = T_p * p = O(M^3 + M^2 / p) * p = **O(pM^3 + M^2)**.
 
