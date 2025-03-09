@@ -112,11 +112,129 @@ void writeMatrix(const std::string &filename, const std::vector<double> &matrix,
     fout.close();
 }
 
+// CUDA kernel for computing one element of the product matrix.
+__global__ void matrixMultiplyKernel(const double* A, const double* B, double* C, int M) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M && col < M) {
+        double sum = 0.0;
+        for (int k = 0; k < M; k++) {
+            sum += A[row * M + k] * B[k * M + col];
+        }
+        C[row * M + col] = sum;
+    }
+}
+
+// Matrix multiplication using CUDA
+void cudaMultiply(const std::vector<double> &A, const std::vector<double> &B,
+                        std::vector<double> &C, int M, int numThreads, int blockSize) {
+    int a_rows = A.size() / M;
+    int a_cols = M;
+    int b_rows = M;
+    int b_cols = M;
+    int c_rows = a_rows;
+    int c_cols = b_cols;
+
+    size_t size_a = a_rows * a_cols * sizeof(double);
+    size_t size_b = b_rows * b_cols * sizeof(double);
+    size_t size_c = c_rows * c_cols * sizeof(double);
+
+    double *d_A = nullptr, *d_B = nullptr, *d_C = nullptr;
+    
+    // Allocate device memory.
+    cudaError_t err = cudaMalloc((void**)&d_A, size_a);
+    if (err != cudaSuccess) {
+         std::cerr << "Error allocating memory for d_A: " << cudaGetErrorString(err) << std::endl;
+         return;
+    }
+    err = cudaMalloc((void**)&d_B, size_b);
+    if (err != cudaSuccess) {
+         std::cerr << "Error allocating memory for d_B: " << cudaGetErrorString(err) << std::endl;
+         cudaFree(d_A);
+         return;
+    }
+    err = cudaMalloc((void**)&d_C, size_c);
+    if (err != cudaSuccess) {
+         std::cerr << "Error allocating memory for d_C: " << cudaGetErrorString(err) << std::endl;
+         cudaFree(d_A);
+         cudaFree(d_B);
+         return;
+    }
+    
+    // Copy host matrices to device memory.
+    err = cudaMemcpy(d_A, A.data(), size_a, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+         std::cerr << "Error copying A to device: " << cudaGetErrorString(err) << std::endl;
+         cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+         return;
+    }
+    err = cudaMemcpy(d_B, B.data(), size_b, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+         std::cerr << "Error copying B to device: " << cudaGetErrorString(err) << std::endl;
+         cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+         return;
+    }
+    
+    // Set up the execution configuration
+    dim3 threadsPerBlock;
+    dim3 blocksPerGrid;
+    
+    if (blockSize == 1024) {
+        threadsPerBlock = dim3(32, 32);
+        blocksPerGrid = dim3((c_cols + 31) / 32, (c_rows + 31) / 32);
+    }
+    else if (blockSize == 2048) {
+	threadsPerBlock = dim3(32, 64);
+	blocksPerGrid = dim3((c_cols + 31) / 32, (c_rows + 63) / 64);
+    }
+    else if (blockSize == 512) {
+	threadsPerBlock = dim3(16, 32);
+	blocksPerGrid = dim3((c_cols + 15) / 16, (c_rows + 31) / 32);
+    }
+    else {
+        std::cerr << "Invalid block size: " << blockSize << "\n";
+        cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+        return;
+    }
+    
+    // Launch the kernel.
+    matrixMultiplyKernel<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, M);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+         std::cerr << "Kernel launch error: " << cudaGetErrorString(err) << std::endl;
+         cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+         return;
+    }
+    
+    // Wait for the kernel to finish.
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+         std::cerr << "cudaDeviceSynchronize error: " << cudaGetErrorString(err) << std::endl;
+         cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+         return;
+    }
+    
+    // Copy the result matrix back to host memory.
+    err = cudaMemcpy(C.data(), d_C, size_c, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+         std::cerr << "Error copying C from device: " << cudaGetErrorString(err) << std::endl;
+    }
+    
+    // Free device memory.
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+}
+
 // Sequential matrix multiplication: C = A * B
 void sequentialMultiply(const std::vector<double> &A, const std::vector<double> &B,
-                        std::vector<double> &C, int M) {
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < M; j++) {
+                        std::vector<double> &C, int M, int numThreads, int blockSize) {
+    // numThreads is not used in this function, but is included to allow hot-swapping
+    // determine row and column sizes based on matrices, not M
+    int rowSize = A.size() / M;
+    int colSize = B.size() / M;
+    for (int i = 0; i < rowSize; i++) {
+        for (int j = 0; j < colSize; j++) {
             double sum = 0.0;
             for (int k = 0; k < M; k++) {
                 sum += A[i * M + k] * B[k * M + j];
@@ -142,10 +260,11 @@ void threadMultiplyWorker(const std::vector<double>& A, const std::vector<double
 
 // Multithreaded multiplication: divides rows among the specified number of threads.
 void multithreadedMultiply(const std::vector<double> &A, const std::vector<double> &B,
-                           std::vector<double> &C, int M, int numThreads) {
+                           std::vector<double> &C, int M, int numThreads, int blockSize) {
     std::vector<std::thread> threads;
-    int rowsPerThread = M / numThreads;
-    int extraRows = M % numThreads;
+    int rowsToProcess = A.size() / M;
+    int rowsPerThread = rowsToProcess / numThreads;
+    int extraRows = rowsToProcess % numThreads;
     int startRow = 0;
     for (int t = 0; t < numThreads; t++) {
         int endRow = startRow + rowsPerThread + (t < extraRows ? 1 : 0);
@@ -159,7 +278,7 @@ void multithreadedMultiply(const std::vector<double> &A, const std::vector<doubl
 }
 
 void openmpMultiply(const std::vector<double>& A, const std::vector<double>& B,
-                    std::vector<double>& C, int M, int numThreads) {
+                    std::vector<double>& C, int M, int numThreads, int blockSize) {
     // Parallelize the outer loop using OpenMP, with a specified number of threads.
     #pragma omp parallel for num_threads(numThreads) schedule(static)
     for (int i = 0; i < M; i++) {
@@ -173,157 +292,46 @@ void openmpMultiply(const std::vector<double>& A, const std::vector<double>& B,
     }
 }
 
-// MPI implementation of matrix multiplication using Cannon's algorithm.
-// A, B, and C are stored as row-major 1D arrays of size M*M.
-// It is assumed that M is divisible by Q = sqrt(usedProcs),
-// where usedProcs = Q*Q and Q = floor(sqrt(total MPI processes)).
-void mpiCannonMultiply(const std::vector<double>& A,
-                       const std::vector<double>& B,
-                       std::vector<double>& C, int M) {
+void distributedMultiply(const std::vector<double>& A, const std::vector<double>& B,
+                         std::vector<double>& C, int M, void (*localMultiplyFunc)(const std::vector<double>&, const std::vector<double>&, std::vector<double>&, int, int, int),
+			 int numThreads, int cudaBlockSize) {
+
     int worldRank, worldSize;
     MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
     MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
 
-    // Determine grid dimensions from the total processes.
-    int gridDim = static_cast<int>(std::floor(std::sqrt(worldSize)));
-    int usedProcs = gridDim * gridDim; // Only these many processes participate.
-
-    // Create a new group and communicator for the used processes.
-    MPI_Group worldGroup;
-    MPI_Comm_group(MPI_COMM_WORLD, &worldGroup);
-    std::vector<int> gridRanks(usedProcs);
-    for (int i = 0; i < usedProcs; i++) {
-        gridRanks[i] = i;  // use the first usedProcs ranks
-    }
-    MPI_Group gridGroup;
-    MPI_Group_incl(worldGroup, usedProcs, gridRanks.data(), &gridGroup);
-    MPI_Comm gridComm;
-    MPI_Comm_create(MPI_COMM_WORLD, gridGroup, &gridComm);
-
-    // Processes not in the grid communicator simply exit.
-    if (gridComm == MPI_COMM_NULL) {
-        MPI_Group_free(&worldGroup);
-        MPI_Group_free(&gridGroup);
-        return;
+    if (M % worldSize != 0) {
+        if (worldRank == 0)
+            std::cerr << "Error: Matrix size M must be divisible by the number of processes.\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    // Create a 2D Cartesian communicator for the grid.
-    int dims[2]    = { gridDim, gridDim };
-    int periods[2] = { 1, 1 }; // wrap-around in both dimensions for Cannon's shifts
-    int reorder    = 1;
-    MPI_Comm cartComm;
-    MPI_Cart_create(gridComm, 2, dims, periods, reorder, &cartComm);
+    int blockSize = M / worldSize;
+    std::vector<double> localA(blockSize * M);
+    std::vector<double> localC(blockSize * M);
 
-    int cartRank;
-    MPI_Comm_rank(cartComm, &cartRank);
-    int coords[2];
-    MPI_Cart_coords(cartComm, cartRank, 2, coords);
+    // Scatter A (each process gets a block of rows)
+    MPI_Scatter(A.data(), blockSize * M, MPI_DOUBLE,
+                localA.data(), blockSize * M, MPI_DOUBLE,
+                0, MPI_COMM_WORLD);
 
-    // Compute the local block size.
-    // (Assumes M is divisible by gridDim.)
-    int blockSize = M / gridDim;
+    // Instead of scattering B, broadcast B to all processes
+    std::vector<double> fullB = B;  // Ensure B is of size M*M on the root
+    MPI_Bcast(fullB.data(), M * M, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    // Allocate local blocks for A, B, and the result C.
-    std::vector<double> localA(blockSize * blockSize);
-    std::vector<double> localB(blockSize * blockSize);
-    std::vector<double> localC(blockSize * blockSize, 0.0);
+    // Compute local block of C
+    localMultiplyFunc(localA, fullB, localC, M, numThreads, cudaBlockSize);
 
-    // Create a derived datatype that describes a block (submatrix) of size blockSize x blockSize
-    // in an M x M matrix stored in row-major order.
-    MPI_Datatype blockType, blockTypeResized;
-    MPI_Type_vector(blockSize, blockSize, M, MPI_DOUBLE, &blockType);
-    MPI_Type_create_resized(blockType, 0, blockSize * sizeof(double), &blockTypeResized);
-    MPI_Type_commit(&blockTypeResized);
-    MPI_Type_free(&blockType); // no longer needed
 
-    // Prepare parameters for scattering the full matrices.
-    // Only the root (cartComm rank 0) holds the full matrices.
-    std::vector<int> sendCounts, displs;
-    if (cartRank == 0) {
-        sendCounts.resize(usedProcs, 1);
-        displs.resize(usedProcs);
-        // For each block, compute the displacement in the global matrix.
-        // The starting element of the block at grid position (i, j) is at row i*blockSize and col j*blockSize.
-        for (int i = 0; i < gridDim; i++) {
-            for (int j = 0; j < gridDim; j++) {
-                displs[i * gridDim + j] = i * M + j * blockSize;
-            }
-        }
-    }
+    // Gather local results into C on the root process
+    MPI_Gather(localC.data(), blockSize * M, MPI_DOUBLE,
+               C.data(), blockSize * M, MPI_DOUBLE,
+               0, MPI_COMM_WORLD);
 
-    // Scatter the blocks of matrix A into localA.
-    MPI_Scatterv((cartRank == 0 ? A.data() : nullptr),
-                 (cartRank == 0 ? sendCounts.data() : nullptr),
-                 (cartRank == 0 ? displs.data() : nullptr),
-                 blockTypeResized,
-                 localA.data(), blockSize * blockSize, MPI_DOUBLE,
-                 0, cartComm);
-
-    // Scatter the blocks of matrix B into localB.
-    MPI_Scatterv((cartRank == 0 ? B.data() : nullptr),
-                 (cartRank == 0 ? sendCounts.data() : nullptr),
-                 (cartRank == 0 ? displs.data() : nullptr),
-                 blockTypeResized,
-                 localB.data(), blockSize * blockSize, MPI_DOUBLE,
-                 0, cartComm);
-
-    // Initial alignment for Cannon's algorithm:
-    // Shift localA left by its row coordinate and localB up by its column coordinate.
-    int src, dst;
-    // For A: shift left by coords[0]
-    MPI_Cart_shift(cartComm, 1, -coords[0], &src, &dst);
-    MPI_Sendrecv_replace(localA.data(), blockSize * blockSize, MPI_DOUBLE,
-                         dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
-    // For B: shift up by coords[1]
-    MPI_Cart_shift(cartComm, 0, -coords[1], &src, &dst);
-    MPI_Sendrecv_replace(localB.data(), blockSize * blockSize, MPI_DOUBLE,
-                         dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
-
-    // Main loop of Cannon's algorithm.
-    for (int step = 0; step < gridDim; step++) {
-        // Multiply local blocks and accumulate into localC.
-        for (int i = 0; i < blockSize; i++) {
-            for (int j = 0; j < blockSize; j++) {
-                for (int k = 0; k < blockSize; k++) {
-                    localC[i * blockSize + j] += localA[i * blockSize + k] * localB[k * blockSize + j];
-                }
-            }
-        }
-        // Shift localA left by one.
-        MPI_Cart_shift(cartComm, 1, -1, &src, &dst);
-        MPI_Sendrecv_replace(localA.data(), blockSize * blockSize, MPI_DOUBLE,
-                             dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
-        // Shift localB up by one.
-        MPI_Cart_shift(cartComm, 0, -1, &src, &dst);
-        MPI_Sendrecv_replace(localB.data(), blockSize * blockSize, MPI_DOUBLE,
-                             dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
-    }
-
-    // Gather the computed localC blocks to the root (cartComm rank 0).
-    std::vector<double> gatheredC;
-    if (cartRank == 0) {
-        gatheredC.resize(M * M, 0.0);
-    }
-    MPI_Gatherv(localC.data(), blockSize * blockSize, MPI_DOUBLE,
-                (cartRank == 0 ? gatheredC.data() : nullptr),
-                (cartRank == 0 ? sendCounts.data() : nullptr),
-                (cartRank == 0 ? displs.data() : nullptr),
-                blockTypeResized,
-                0, cartComm);
-
-    // Now, have the rank 0 process of MPI_COMM_WORLD (which is also cartComm rank 0)
-    // copy the gathered result into C.
-    if (worldRank == 0 && cartRank == 0) {
-        C = gatheredC;
-    }
-
-    // Clean up.
-    MPI_Type_free(&blockTypeResized);
-    MPI_Comm_free(&cartComm);
-    MPI_Comm_free(&gridComm);
-    MPI_Group_free(&gridGroup);
-    MPI_Group_free(&worldGroup);
+    // Synchronize processes
+    MPI_Barrier(MPI_COMM_WORLD);
 }
+
 
 // Structure to hold timing results
 struct Timing {
@@ -333,12 +341,12 @@ struct Timing {
     double t_total;
 };
 
-enum VariantType { V1, V2A, V2B, V3A, V3B, V4A };
+enum VariantType { V1, V2A, V2B, V3A, V3B, V4A, V4B, V5A, V5B, V6, V7A, V7B };
 
 
 // Run one experiment iteration using the given multiplication function.
 Timing runExperiment(const std::string &fileA, const std::string &fileB, const std::string &fileC,
-                     int M, VariantType var, int numThreads = 1) {
+                     int M, VariantType var, int numThreads = 1, int blockSize = 1024) {
     Timing t{0, 0, 0, 0};
     std::vector<double> A, B, C(M * M);
     auto startTotal = std::chrono::high_resolution_clock::now();
@@ -363,6 +371,24 @@ Timing runExperiment(const std::string &fileA, const std::string &fileB, const s
     } else if (var == V4A) {
 	    sequentialReadMatrix(fileA, A, M);
 	    sequentialReadMatrix(fileB, B, M);
+    } else if (var == V4B) {
+	    parallelReadMatrix(fileA, A, M, numThreads);
+	    parallelReadMatrix(fileB, B, M, numThreads);
+    } else if (var == V5A) {
+	    sequentialReadMatrix(fileA, A, M);
+	    sequentialReadMatrix(fileB, B, M);
+    } else if (var == V5B) {
+	    parallelReadMatrix(fileA, A, M, numThreads);
+	    parallelReadMatrix(fileB, B, M, numThreads);
+    } else if (var == V6) {
+	    sequentialReadMatrix(fileA, A, M);
+	    sequentialReadMatrix(fileB, B, M);
+    } else if (var == V7A) {
+	    sequentialReadMatrix(fileA, A, M);
+	    sequentialReadMatrix(fileB, B, M);
+    } else if (var == V7B) {
+	    parallelReadMatrix(fileA, A, M, numThreads);
+	    parallelReadMatrix(fileB, B, M, numThreads);
     }
 	auto endRead = std::chrono::high_resolution_clock::now();
     t.t_reading = std::chrono::duration<double>(endRead - startRead).count();
@@ -370,17 +396,29 @@ Timing runExperiment(const std::string &fileA, const std::string &fileB, const s
     // Multiplication phase
     auto startMul = std::chrono::high_resolution_clock::now();
     if (var == V1) {
-        sequentialMultiply(A, B, C, M);
+    	sequentialMultiply(A, B, C, M, numThreads, blockSize);
     } else if (var == V2A) {
-        multithreadedMultiply(A, B, C, M, numThreads);
+        multithreadedMultiply(A, B, C, M, numThreads, blockSize);
     } else if (var == V2B) {
-        sequentialMultiply(A, B, C, M);
+        sequentialMultiply(A, B, C, M, numThreads, blockSize);
     } else if (var == V3A) {
-			openmpMultiply(A, B, C, M, numThreads);
+	openmpMultiply(A, B, C, M, numThreads, blockSize);
     } else if (var == V3B) {
-			openmpMultiply(A, B, C, M, numThreads);
+	openmpMultiply(A, B, C, M, numThreads, blockSize);
     } else if (var == V4A) {
-			mpiCannonMultiply(A, B, C, M);
+	distributedMultiply(A, B, C, M, &sequentialMultiply, numThreads, blockSize);
+    } else if (var == V4B) {
+	distributedMultiply(A, B, C, M, &sequentialMultiply, numThreads, blockSize);
+    } else if (var == V5A) {
+	distributedMultiply(A, B, C, M, &multithreadedMultiply, numThreads, blockSize);
+    } else if (var == V5B) {
+	distributedMultiply(A, B, C, M, &multithreadedMultiply, numThreads, blockSize);
+    } else if (var == V6) {
+	cudaMultiply(A, B, C, M, numThreads, blockSize);
+    } else if (var == V7A) {
+	distributedMultiply(A, B, C, M, &cudaMultiply, numThreads, blockSize);
+    } else if (var == V7B) {
+	distributedMultiply(A, B, C, M, &cudaMultiply, numThreads, blockSize);
     }
     auto endMul = std::chrono::high_resolution_clock::now();
     t.t_multiplication = std::chrono::duration<double>(endMul - startMul).count();
@@ -392,9 +430,13 @@ Timing runExperiment(const std::string &fileA, const std::string &fileB, const s
 	MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
 	std::cout << "Writing output if needed, world rank: " << worldRank << "\n";
 	if (worldRank == 0) {
-			writeMatrix(fileC, C, M);
-			std::cout << "Output written to " << fileC << "\n";
-    }
+		std::cout << "Entering write phase\n";
+		writeMatrix(fileC, C, M);
+		std::cout << "Output written to " << fileC << "\n";
+	}
+
+	MPI_Barrier(MPI_COMM_WORLD);
+
     auto endWrite = std::chrono::high_resolution_clock::now();
     t.t_writing = std::chrono::duration<double>(endWrite - startWrite).count();
 
@@ -425,6 +467,7 @@ void printUsage(const char* progName) {
     std::cerr << "Usage: " << progName << " --variant <variant> --M <matrix_size> [--threads <numThreads>]\n";
     std::cerr << "  <variant> can be \"1\" for sequential or \"2a\" (or similar) for multithreaded.\n";
     std::cerr << "  For multithreaded variant, --threads must be specified (e.g., 10, 20, or 50).\n";
+    std::cerr << "  For CUDA variant, --blockSize must be specified (e.g., 1024 or 4096).\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -433,11 +476,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-	MPI_Init(&argc, &argv);
+    MPI_Init(&argc, &argv);
 
     std::string variantStr, fileA, fileB, fileC, jsonFile;
     int M = 0;
     int numThreads = 1;
+    int blockSize = 1;
     // Simple argument parsing
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--variant") == 0 && i + 1 < argc) {
@@ -446,13 +490,15 @@ int main(int argc, char* argv[]) {
             M = std::atoi(argv[++i]);
         } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             numThreads = std::atoi(argv[++i]);
-        }
+        } else if (strcmp(argv[i], "--blockSize") == 0 && i + 1 < argc) {
+	    blockSize = std::atoi(argv[++i]);
+	}
     }
 
     fileA = "A_M" + std::to_string(M) + ".bin";
 	fileB = "B_M" + std::to_string(M) + ".bin";
-	fileC = "C_V" + variantStr + "_M" + std::to_string(M) + ".txt"; 
-	jsonFile = variantStr + "_M" + std::to_string(M) + "_T" + std::to_string(numThreads) + ".json";
+	fileC = "C_V" + variantStr + "_M" + std::to_string(M) + "_T" + std::to_string(numThreads) + "_B" + std::to_string(blockSize) + ".txt";
+	jsonFile = variantStr + "_M" + std::to_string(M) + "_T" + std::to_string(numThreads) + "_B" + std::to_string(blockSize) + ".json";
 
     if (M <= 0 || variantStr.empty() || fileA.empty() || fileB.empty() || fileC.empty() || jsonFile.empty()) {
         printUsage(argv[0]);
@@ -473,6 +519,18 @@ int main(int argc, char* argv[]) {
 			currentVariant = V3B;
     } else if (variantStr == "4a") {
 			currentVariant = V4A;
+    } else if (variantStr == "4b") {
+			currentVariant = V4B;
+    } else if (variantStr == "5a") {
+			currentVariant = V5A;
+    } else if (variantStr == "5b") {
+			currentVariant = V5B;
+    } else if (variantStr == "6") {
+			currentVariant = V6;
+    } else if (variantStr == "7a") {
+	    		currentVariant = V7A;
+    } else if (variantStr == "7b") {
+	    		currentVariant = V7B;
     } else {
 	std::cerr << "Unknown variant: " << variantStr << "\n";
 	return 1;
@@ -505,7 +563,7 @@ int main(int argc, char* argv[]) {
     double totalReading = 0.0, totalMultiplication = 0.0, totalWriting = 0.0, totalTotal = 0.0;
     for (int run = 0; run < numRuns; run++) {
 	std::cout << "Run " << run + 1 << " of " << numRuns << "\n";
-        Timing t = runExperiment(fileA, fileB, fileC, M, currentVariant, numThreads);
+        Timing t = runExperiment(fileA, fileB, fileC, M, currentVariant, numThreads, blockSize);
         totalReading += t.t_reading;
         totalMultiplication += t.t_multiplication;
         totalWriting += t.t_writing;
@@ -531,5 +589,6 @@ int main(int argc, char* argv[]) {
 			}
     }
 
+    MPI_Finalize();
     return 0;
 }
