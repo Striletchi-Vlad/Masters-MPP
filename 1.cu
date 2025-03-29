@@ -293,46 +293,6 @@ void openmpMultiply(const std::vector<double>& A, const std::vector<double>& B,
     }
 }
 
-// void distributedMultiply(const std::vector<double>& A, const std::vector<double>& B,
-//                          std::vector<double>& C, int M, void (*localMultiplyFunc)(const std::vector<double>&, const std::vector<double>&, std::vector<double>&, int, int, int),
-// 			 int numThreads, int cudaBlockSize) {
-//
-//     int worldRank, worldSize;
-//     MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
-//     MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
-//
-//     if (M % worldSize != 0) {
-//         if (worldRank == 0)
-//             std::cerr << "Error: Matrix size M must be divisible by the number of processes.\n";
-//         MPI_Abort(MPI_COMM_WORLD, 1);
-//     }
-//
-//     int blockSize = M / worldSize;
-//     std::vector<double> localA(blockSize * M);
-//     std::vector<double> localC(blockSize * M);
-//
-//     // Scatter A (each process gets a block of rows)
-//     MPI_Scatter(A.data(), blockSize * M, MPI_DOUBLE,
-//                 localA.data(), blockSize * M, MPI_DOUBLE,
-//                 0, MPI_COMM_WORLD);
-//
-//     // Instead of scattering B, broadcast B to all processes
-//     std::vector<double> fullB = B;  // Ensure B is of size M*M on the root
-//     MPI_Bcast(fullB.data(), M * M, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-//
-//     // Compute local block of C
-//     localMultiplyFunc(localA, fullB, localC, M, numThreads, cudaBlockSize);
-//
-//
-//     // Gather local results into C on the root process
-//     MPI_Gather(localC.data(), blockSize * M, MPI_DOUBLE,
-//                C.data(), blockSize * M, MPI_DOUBLE,
-//                0, MPI_COMM_WORLD);
-//
-//     // Synchronize processes
-//     MPI_Barrier(MPI_COMM_WORLD);
-// }
-
 
 // distributedMultiply uses Cannon's algorithm to perform distributed matrix multiplication.
 // A and B are M×M matrices stored in row-major order, and C will store the result (only on root).
