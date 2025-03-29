@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <omp.h>
 #include <mpi.h>
+#include <cmath>
 
 // Helper: check if a file exists
 bool fileExists(const std::string &filename) {
@@ -292,44 +293,210 @@ void openmpMultiply(const std::vector<double>& A, const std::vector<double>& B,
     }
 }
 
-void distributedMultiply(const std::vector<double>& A, const std::vector<double>& B,
-                         std::vector<double>& C, int M, void (*localMultiplyFunc)(const std::vector<double>&, const std::vector<double>&, std::vector<double>&, int, int, int),
-			 int numThreads, int cudaBlockSize) {
+// void distributedMultiply(const std::vector<double>& A, const std::vector<double>& B,
+//                          std::vector<double>& C, int M, void (*localMultiplyFunc)(const std::vector<double>&, const std::vector<double>&, std::vector<double>&, int, int, int),
+// 			 int numThreads, int cudaBlockSize) {
+//
+//     int worldRank, worldSize;
+//     MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
+//     MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
+//
+//     if (M % worldSize != 0) {
+//         if (worldRank == 0)
+//             std::cerr << "Error: Matrix size M must be divisible by the number of processes.\n";
+//         MPI_Abort(MPI_COMM_WORLD, 1);
+//     }
+//
+//     int blockSize = M / worldSize;
+//     std::vector<double> localA(blockSize * M);
+//     std::vector<double> localC(blockSize * M);
+//
+//     // Scatter A (each process gets a block of rows)
+//     MPI_Scatter(A.data(), blockSize * M, MPI_DOUBLE,
+//                 localA.data(), blockSize * M, MPI_DOUBLE,
+//                 0, MPI_COMM_WORLD);
+//
+//     // Instead of scattering B, broadcast B to all processes
+//     std::vector<double> fullB = B;  // Ensure B is of size M*M on the root
+//     MPI_Bcast(fullB.data(), M * M, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+//
+//     // Compute local block of C
+//     localMultiplyFunc(localA, fullB, localC, M, numThreads, cudaBlockSize);
+//
+//
+//     // Gather local results into C on the root process
+//     MPI_Gather(localC.data(), blockSize * M, MPI_DOUBLE,
+//                C.data(), blockSize * M, MPI_DOUBLE,
+//                0, MPI_COMM_WORLD);
+//
+//     // Synchronize processes
+//     MPI_Barrier(MPI_COMM_WORLD);
+// }
 
+
+// distributedMultiply uses Cannon's algorithm to perform distributed matrix multiplication.
+// A and B are M×M matrices stored in row-major order, and C will store the result (only on root).
+// localMultiplyFunc performs the multiplication of two square submatrices of size 'blockSize' (and may use threads or CUDA).
+void distributedMultiply(const std::vector<double>& A, const std::vector<double>& B,
+                         std::vector<double>& C, int M,
+                         void (*localMultiplyFunc)(const std::vector<double>&,
+                                                   const std::vector<double>&,
+                                                   std::vector<double>&, int, int, int),
+			 int numThreads, int cudaBlockSize) {
     int worldRank, worldSize;
     MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
     MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
 
-    if (M % worldSize != 0) {
+    // Cannon's algorithm requires a square grid of processes.
+    int sqrtP = static_cast<int>(std::sqrt(worldSize));
+    if (sqrtP * sqrtP != worldSize) {
         if (worldRank == 0)
-            std::cerr << "Error: Matrix size M must be divisible by the number of processes.\n";
+            std::cerr << "Error: Number of processes (" << worldSize 
+                      << ") must be a perfect square for Cannon's algorithm.\n";
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    int blockSize = M / worldSize;
-    std::vector<double> localA(blockSize * M);
-    std::vector<double> localC(blockSize * M);
+    // Ensure the matrix dimension is divisible by the grid dimension.
+    if (M % sqrtP != 0) {
+        if (worldRank == 0)
+            std::cerr << "Error: Matrix size M (" << M 
+                      << ") must be divisible by sqrt(number of processes) (" << sqrtP << ").\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 
-    // Scatter A (each process gets a block of rows)
-    MPI_Scatter(A.data(), blockSize * M, MPI_DOUBLE,
-                localA.data(), blockSize * M, MPI_DOUBLE,
-                0, MPI_COMM_WORLD);
+    int blockSize = M / sqrtP;
 
-    // Instead of scattering B, broadcast B to all processes
-    std::vector<double> fullB = B;  // Ensure B is of size M*M on the root
-    MPI_Bcast(fullB.data(), M * M, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    // Create a 2D Cartesian communicator with periodic boundaries.
+    int dims[2] = {sqrtP, sqrtP};
+    int periods[2] = {1, 1};
+    MPI_Comm cartComm;
+    MPI_Cart_create(MPI_COMM_WORLD, 2, dims, periods, 1, &cartComm);
 
-    // Compute local block of C
-    localMultiplyFunc(localA, fullB, localC, M, numThreads, cudaBlockSize);
+    int coords[2];
+    MPI_Cart_coords(cartComm, worldRank, 2, coords);
 
+    // Allocate local submatrices: each is blockSize x blockSize.
+    std::vector<double> localA(blockSize * blockSize);
+    std::vector<double> localB(blockSize * blockSize);
+    std::vector<double> localC(blockSize * blockSize, 0.0);
 
-    // Gather local results into C on the root process
-    MPI_Gather(localC.data(), blockSize * M, MPI_DOUBLE,
-               C.data(), blockSize * M, MPI_DOUBLE,
-               0, MPI_COMM_WORLD);
+    // --------------------
+    // Scatter submatrices
+    // --------------------
+    // For Cannon's algorithm we need a 2D block decomposition.
+    // Here, the root (rank 0) extracts each block from A and B and sends it to the appropriate process.
+    if (worldRank == 0) {
+        // Scatter A: send each block to the corresponding process.
+        for (int proc = 0; proc < worldSize; proc++) {
+            int procCoords[2] = {proc / sqrtP, proc % sqrtP};
+            std::vector<double> block(blockSize * blockSize);
+            for (int i = 0; i < blockSize; i++) {
+                for (int j = 0; j < blockSize; j++) {
+                    int globalRow = procCoords[0] * blockSize + i;
+                    int globalCol = procCoords[1] * blockSize + j;
+                    block[i * blockSize + j] = A[globalRow * M + globalCol];
+                }
+            }
+            if (proc == 0)
+                localA = block;
+            else
+                MPI_Send(block.data(), blockSize * blockSize, MPI_DOUBLE, proc, 0, MPI_COMM_WORLD);
+        }
+        // Scatter B similarly.
+        for (int proc = 0; proc < worldSize; proc++) {
+            int procCoords[2] = {proc / sqrtP, proc % sqrtP};
+            std::vector<double> block(blockSize * blockSize);
+            for (int i = 0; i < blockSize; i++) {
+                for (int j = 0; j < blockSize; j++) {
+                    int globalRow = procCoords[0] * blockSize + i;
+                    int globalCol = procCoords[1] * blockSize + j;
+                    block[i * blockSize + j] = B[globalRow * M + globalCol];
+                }
+            }
+            if (proc == 0)
+                localB = block;
+            else
+                MPI_Send(block.data(), blockSize * blockSize, MPI_DOUBLE, proc, 1, MPI_COMM_WORLD);
+        }
+    } else {
+        MPI_Recv(localA.data(), blockSize * blockSize, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(localB.data(), blockSize * blockSize, MPI_DOUBLE, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
 
-    // Synchronize processes
+    // ---------------------------------------------------------
+    // Initial alignment: skew localA left and localB up.
+    // ---------------------------------------------------------
+    // Each process (i, j) shifts A left by i positions.
+    for (int i = 0; i < coords[0]; i++) {
+        int src, dst;
+        MPI_Cart_shift(cartComm, 1, -1, &src, &dst);
+        MPI_Sendrecv_replace(localA.data(), blockSize * blockSize, MPI_DOUBLE,
+                             dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
+    }
+    // Each process (i, j) shifts B up by j positions.
+    for (int i = 0; i < coords[1]; i++) {
+        int src, dst;
+        MPI_Cart_shift(cartComm, 0, -1, &src, &dst);
+        MPI_Sendrecv_replace(localB.data(), blockSize * blockSize, MPI_DOUBLE,
+                             dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
+    }
+
+    // -------------------------
+    // Main Cannon's algorithm loop
+    // -------------------------
+    // There will be sqrtP steps. At each step, multiply the local submatrices
+    // and then shift A left and B up by one.
+    for (int step = 0; step < sqrtP; step++) {
+        // Multiply local submatrices and accumulate into localC.
+        // Note: We pass blockSize as the matrix dimension for the local multiplication.
+        localMultiplyFunc(localA, localB, localC, blockSize, numThreads, cudaBlockSize);
+
+        // Shift localA one step to the left.
+        {
+            int src, dst;
+            MPI_Cart_shift(cartComm, 1, -1, &src, &dst);
+            MPI_Sendrecv_replace(localA.data(), blockSize * blockSize, MPI_DOUBLE,
+                                 dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
+        }
+        // Shift localB one step upward.
+        {
+            int src, dst;
+            MPI_Cart_shift(cartComm, 0, -1, &src, &dst);
+            MPI_Sendrecv_replace(localB.data(), blockSize * blockSize, MPI_DOUBLE,
+                                 dst, 0, src, 0, cartComm, MPI_STATUS_IGNORE);
+        }
+    }
+
+    // ---------------------------------------------------------
+    // Gather the localC blocks back into the global C matrix.
+    // ---------------------------------------------------------
+    if (worldRank == 0) {
+        C.resize(M * M, 0.0);
+        // Place the block from process 0.
+        for (int i = 0; i < blockSize; i++) {
+            for (int j = 0; j < blockSize; j++) {
+                C[i * M + j] = localC[i * blockSize + j];
+            }
+        }
+        // Receive blocks from the other processes.
+        for (int proc = 1; proc < worldSize; proc++) {
+            int procCoords[2] = {proc / sqrtP, proc % sqrtP};
+            std::vector<double> block(blockSize * blockSize);
+            MPI_Recv(block.data(), blockSize * blockSize, MPI_DOUBLE, proc, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            for (int i = 0; i < blockSize; i++) {
+                for (int j = 0; j < blockSize; j++) {
+                    int globalRow = procCoords[0] * blockSize + i;
+                    int globalCol = procCoords[1] * blockSize + j;
+                    C[globalRow * M + globalCol] = block[i * blockSize + j];
+                }
+            }
+        }
+    } else {
+        MPI_Send(localC.data(), blockSize * blockSize, MPI_DOUBLE, 0, 2, MPI_COMM_WORLD);
+    }
+
     MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Comm_free(&cartComm);
 }
 
 
@@ -428,7 +595,7 @@ Timing runExperiment(const std::string &fileA, const std::string &fileB, const s
     auto startWrite = std::chrono::high_resolution_clock::now();
 	int worldRank;
 	MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
-	std::cout << "Writing output if needed, world rank: " << worldRank << "\n";
+	// std::cout << "Writing output if needed, world rank: " << worldRank << "\n";
 	if (worldRank == 0) {
 		std::cout << "Entering write phase\n";
 		writeMatrix(fileC, C, M);
@@ -534,6 +701,7 @@ int main(int argc, char* argv[]) {
 	std::cerr << "Unknown variant: " << variantStr << "\n";
 	return 1;
     }
+
     // Generate the input matrices if they do not exist.
     try {
         if (!fileExists(fileA)) {
@@ -556,12 +724,14 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Running experiment with variant " << variantStr << " and matrix size " << M << "\n";
 
+
     // Run 10 executions for the chosen variant
-    // const int numRuns = 10;
-    const int numRuns = 1;
+    const int numRuns = 10;
     double totalReading = 0.0, totalMultiplication = 0.0, totalWriting = 0.0, totalTotal = 0.0;
     for (int run = 0; run < numRuns; run++) {
-	std::cout << "Run " << run + 1 << " of " << numRuns << "\n";
+	if (worldRank == 0) {
+		std::cout << "Run " << run + 1 << " of " << numRuns << "\n";
+	}
         Timing t = runExperiment(fileA, fileB, fileC, M, currentVariant, numThreads, blockSize);
         totalReading += t.t_reading;
         totalMultiplication += t.t_multiplication;
@@ -573,11 +743,28 @@ int main(int argc, char* argv[]) {
     double avgWriting = totalWriting / numRuns;
     double avgTotal = totalTotal / numRuns;
 
+
+    // If variant is different than 1, load matrix C and compare it with the result.
+    if (worldRank == 0 && currentVariant != V1) {
+	std::vector<double> C1(M * M), C2(M * M);
+	try {
+	    auto benchFileC = "C_V1_M" + std::to_string(M) + "_T" + std::to_string(numThreads) + "_B" + std::to_string(blockSize) + ".txt";
+	    sequentialReadMatrix(fileC, C1, M);
+	    sequentialReadMatrix(fileC, C2, M);
+	} catch (const std::exception &e) {
+	    std::cerr << "Error reading matrix C: " << e.what() << "\n";
+	    return 1;
+	}
+	if (C1 != C2) {
+	    std::cerr << "Error: Matrices C1 and C2 are different.\n";
+	    return 1;
+	}
+
+	std::cout << "PASS Matrices C1 and C2 are equal.\n";
+    }
+
     // Output the averaged timings and speed-up in JSON format.
     auto startWrite = std::chrono::high_resolution_clock::now();
-	int worldRank;
-	MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
-	std::cout << "Writing JSON output if needed, world rank: " << worldRank << "\n";
 	if (worldRank == 0) {
 			try {
 				writeJSON(jsonFile, variantStr, avgReading, avgMultiplication, avgWriting, avgTotal);
