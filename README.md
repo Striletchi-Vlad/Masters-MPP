@@ -176,8 +176,6 @@
   - **Cost:**  
     Parallel execution time × (CPU + GPU resource usage), influenced by `p₁`.
 
----
-
 - **7b: Parallel reading, parallel multiplication (MPI Cannon's + CUDA), sequential writing**
 
   - **Time Complexity:**
@@ -201,7 +199,3 @@
 
   - **Cost:**  
     Same as 7a, with potentially better resource utilization due to reduced read time.
-
----
-
-Let me know if you'd like this put into a table or diagram for clarity!
