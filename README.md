@@ -33,8 +33,6 @@
     - **Cost**: C = T_p * p = O(M^2 / p + M^3 / p + M^2) * p = **O(M^2 + M^3 + pM^2)**.
 
 **4. Parallel - MPI (4 cluster nodes) – using row distribution (Variants 4a and 4b)**:
-- Number of Processes (p): 20, 40. These processes are distributed across 4 cluster nodes.
-
 - **4a: Sequential reading, parallel multiplication (Cannon's), sequential writing.**
   - **Time Complexity:**
     - **Sequential Reading:**  
@@ -95,9 +93,6 @@
     Cost (C) = T<sub>parallel</sub> × Number of Processes = O(M²/p + M³/sqrt(p) + M²/sqrt(p)) × _p_ = O(M² + M³·sqrt(p) + M²·sqrt(p)).
 
 **5. Parallel - MPI+Multithreading (4 cluster nodes) (Variants 5a and 5b)**:
-- Number of Processes (p1): 20, 40.
-- Number of Threads per process (p2): 10, 20.
-- Total processing elements (p = p1 * p2): 200, 400, 400, 800.
 - **5a: Sequential reading, parallel multiplication (MPI Cannon's + Multithreading)**
   - **Time Complexity:**
     - **Sequential Reading:**  
