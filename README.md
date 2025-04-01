@@ -140,17 +140,6 @@
     -   **Cost**: Cost here could be thought of in terms of the time taken multiplied by the "cost" of using the GPU resources.
 
 - **7. Parallel - MPI+CUDA (4 cluster nodes)**
--   **7a: Sequential reading, parallel multiplication, sequential writing**
-    -   **Time Complexity**: The initial sequential reading is **O(M^2)**. The parallel multiplication involves MPI communication to distribute work and data, and then GPU-accelerated local computation. If the matrix is divided into 4 roughly equal parts by the MPI processes, each GPU would ideally handle an **O(M^3 / 4)** operation (ignoring communication and data transfer). The overall time would be influenced by the slowest process, which would include communication, data transfer to/from the GPU, and the GPU computation time. The final sequential writing is **O(M^2)**.
-    -   **Speed-up**: This approach has the potential for significant speed-up by leveraging both distributed computing and GPU acceleration.
-    -   **Efficiency**: Efficiency would consider the utilization of both the CPU cores involved in MPI communication and the GPU resources.
-    -   **Cost**: Cost would be the parallel execution time multiplied by the total "cost" of the resources used (CPU time across nodes + GPU time).
-
--   **7b: Parallel reading, parallel multiplication, sequential writing**
-    -   **Time Complexity**: The parallel reading could reduce the initial overhead to roughly **O(M^2 / 4)** (again, assuming good parallel file system performance). The rest of the analysis is similar to 7a, with MPI communication and GPU computation dominating the parallel phase. The overall time complexity might be closer to **O(M^2 / 4 + MPI\_communication\_time + GPU\_computation\_time)**.
-    -   **Speed-up**: The parallel reading might offer a further improvement in speed-up over 7a.
-    -   **Efficiency**: Efficiency considerations are similar to 7a.
-    -   **Cost**: Cost is also similar to 7a.
 
 - **7a: Sequential reading, parallel multiplication (MPI Cannon's + CUDA), sequential writing**
 
@@ -159,42 +148,60 @@
       O(M²)
     - **Parallel Multiplication:**  
       - **Cannon's Algorithm:**  
-        Executed across p₁ = 4 processes.
+        Executed across `p₁` processes.
       - **Communication (MPI):**  
-        Communication costs for scatter, initial alignment, and cyclic shifts of (M/2) × (M/2) blocks. The dominant communication cost is roughly O(M²/2) per step, over √4 = 2 steps.
+        The matrix is divided into √p₁ × √p₁ blocks.  
+        Communication costs for scatter, initial alignment, and cyclic shifts of (M/√p₁) × (M/√p₁) blocks.  
+        Each of the √p₁ steps involves communication of O(M²/p₁), so total communication cost is approximately  
+        **O(√p₁ × M²/p₁) = O(M²/√p₁)**
       - **Local Multiplication (CUDA):**  
-        Each of the 4 processes uses CUDA to multiply its (M/2) × (M/2) submatrices. The time complexity of CUDA multiplication depends on the GPU architecture but is generally much faster than CPU-based methods for large matrices, potentially approaching O((M/2)³ divided by the number of CUDA cores) plus data transfer overhead. This occurs in 2 steps of Cannon's algorithm.
+        Each of the `p₁` processes multiplies its local (M/√p₁) × (M/√p₁) submatrices using CUDA.  
+        Assuming CUDA provides speedup, the time complexity is  
+        **O((M/√p₁)³ / cuda_speedup) + data_transfer_overhead**
+        This multiplication occurs over √p₁ steps in Cannon's algorithm.
     - **Sequential Writing:**  
       O(M²)
     - **Overall Time Complexity:**  
-      Approximately O(M² + MPI_communication_time + CUDA_multiplication_time). For large M, the CUDA multiplication time will likely be the most significant factor after the initial reading.
+      Approximately  
+      **O(M² + M²/√p₁ + CUDA_multiplication_time)**  
+      For large M, CUDA multiplication time typically dominates.
       
   - **Speed-up:**  
-    Significant speed-up is expected compared to sequential execution, leveraging both distributed computing and GPU acceleration. The actual speed-up will depend on the efficiency of the CUDA kernel and the MPI communication overhead.
-    
+    Significant speed-up over sequential execution due to MPI parallelism and GPU acceleration.  
+    Performance scales with both `p₁` and CUDA efficiency.
+
   - **Efficiency:**  
-    Efficiency depends on the effective utilization of both the CPU cores for MPI and the GPU resources.
-    
+    Depends on how well the computation and communication are balanced across `p₁` processes, and on CUDA utilization.
+
   - **Cost:**  
-    Cost is the parallel execution time multiplied by the "cost" of using both CPU and GPU resources.
+    Parallel execution time × (CPU + GPU resource usage), influenced by `p₁`.
+
+---
 
 - **7b: Parallel reading, parallel multiplication (MPI Cannon's + CUDA), sequential writing**
 
   - **Time Complexity:**
     - **Parallel Reading:**  
-      O(M²/p₁) = O(M²/4)
+      O(M²/p₁)
     - **Parallel Multiplication:**  
-      Similar to 7a, with MPI communication of (M/2) × (M/2) blocks and local CUDA multiplication of (M/2) × (M/2) submatrices in 2 steps.
+      Same as 7a:
+      - Communication: **O(M²/√p₁)**
+      - CUDA local multiplication: **O((M/√p₁)³ / cuda_speedup) + overhead**
     - **Sequential Writing:**  
       O(M²)
     - **Overall Time Complexity:**  
-      Approximately O(M²/4 + MPI_communication_time + CUDA_multiplication_time). The use of parallel reading might further reduce the initial overhead.
+      Approximately  
+      **O(M²/p₁ + M²/√p₁ + CUDA_multiplication_time)**
       
   - **Speed-up:**  
-    Potentially better speed-up than 7a due to the reduced reading time.
-    
+    Better than 7a due to parallel reading reducing initial I/O bottleneck.
+
   - **Efficiency:**  
-    Efficiency considerations are similar to those in 7a.
-    
+    Improved I/O balance. Efficiency still depends on CUDA kernel performance and MPI communication cost scaling with `p₁`.
+
   - **Cost:**  
-    Cost considerations are also similar to those in 7a.
+    Same as 7a, with potentially better resource utilization due to reduced read time.
+
+---
+
+Let me know if you'd like this put into a table or diagram for clarity!
